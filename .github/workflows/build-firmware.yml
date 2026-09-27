@@ -1,0 +1,161 @@
+name: Build ESP32 firmware
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - "main/**"
+      - ".github/workflows/build-firmware.yml"
+
+permissions:
+  contents: write
+
+jobs:
+  version-check:
+    runs-on: ubuntu-latest
+    outputs:
+      should_build: ${{ steps.check.outputs.should_build }}
+      version: ${{ steps.check.outputs.version }}
+    steps:
+      - name: Check out repository history
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Check whether OTA_FIRMWARE_VERSION changed
+        id: check
+        env:
+          BEFORE_SHA: ${{ github.event.before }}
+        run: |
+          python3 - <<'PY'
+          import os
+          import re
+          import subprocess
+          from pathlib import Path
+
+          path = "main/main.ino"
+          current_text = Path(path).read_text(encoding="utf-8")
+
+          def get_version(text):
+              match = re.search(r'OTA_FIRMWARE_VERSION\s*=\s*"([^"]+)"', text)
+              if not match:
+                  raise SystemExit(f"Could not find OTA_FIRMWARE_VERSION in {path}")
+              version = match.group(1)
+              if not re.fullmatch(r"\d+\.\d+\.\d+", version):
+                  raise SystemExit(f"Use MAJOR.MINOR.PATCH for OTA_FIRMWARE_VERSION; got {version}")
+              return version
+
+          current_version = get_version(current_text)
+          before = os.environ.get("BEFORE_SHA", "")
+          if not before or set(before) == {"0"}:
+              previous_version = None
+          else:
+              result = subprocess.run(
+                  ["git", "show", f"{before}:{path}"],
+                  text=True,
+                  capture_output=True,
+              )
+              previous_version = get_version(result.stdout) if result.returncode == 0 else None
+
+          changed = previous_version != current_version
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
+              output.write(f"should_build={str(changed).lower()}\n")
+              output.write(f"version={current_version}\n")
+          if changed:
+              print(f"OTA version changed to {current_version}; build will run.")
+          else:
+              print(f"OTA version is still {current_version}; skipping build and release.")
+          PY
+
+  build:
+    needs: version-check
+    if: needs.version-check.outputs.should_build == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Install Arduino CLI and ESP32 platform
+        uses: arduino/setup-arduino-cli@v2
+
+      - name: Install ESP32 core and ArduinoJson
+        run: |
+          arduino-cli core update-index
+          arduino-cli core install esp32:esp32
+          arduino-cli lib install ArduinoJson
+
+      - name: Compile firmware
+        run: |
+          mkdir -p main/build
+          arduino-cli compile --fqbn esp32:esp32:esp32 --output-dir main/build main
+          cp main/build/main.ino.bin main/build/firmware.bin
+
+      - name: Generate manifest
+        env:
+          FIRMWARE_VERSION: ${{ needs.version-check.outputs.version }}
+        run: |
+          python3 - <<'PY'
+          import hashlib
+          import json
+          import os
+          import re
+          from pathlib import Path
+
+          binary = Path("main/build/firmware.bin")
+          source = Path("main/main.ino").read_text(encoding="utf-8")
+          match = re.search(r'OTA_DEVICE_MODEL\s*=\s*"([^"]+)"', source)
+          if not match:
+              raise SystemExit("Could not find OTA_DEVICE_MODEL in main/main.ino")
+
+          version = os.environ["FIRMWARE_VERSION"]
+          repository = os.environ["GITHUB_REPOSITORY"]
+          data = binary.read_bytes()
+          manifest = {
+              "device": match.group(1),
+              "version": version,
+              "url": f"https://github.com/{repository}/releases/download/v{version}/firmware.bin",
+              "size": len(data),
+              "sha256": hashlib.sha256(data).hexdigest(),
+          }
+          Path("firmware/manifest.json").write_text(
+              json.dumps(manifest, indent=2) + "\n", encoding="utf-8"
+          )
+          print(json.dumps(manifest, indent=2))
+          PY
+
+      - name: Commit updated manifest
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add firmware/manifest.json
+          if git diff --cached --quiet; then
+            echo "Manifest did not change; nothing to commit."
+          else
+            git commit -m "Update firmware manifest to v${{ needs.version-check.outputs.version }}"
+            git push origin HEAD:main
+          fi
+
+      - name: Create GitHub Release and upload firmware
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          FIRMWARE_VERSION: ${{ needs.version-check.outputs.version }}
+        run: |
+          tag="v${FIRMWARE_VERSION}"
+          if gh release view "$tag" >/dev/null 2>&1; then
+            echo "Release $tag already exists. Set a new OTA_FIRMWARE_VERSION instead of reusing a release version."
+            exit 1
+          fi
+          gh release create "$tag" main/build/firmware.bin \
+            --title "ESP32 firmware ${FIRMWARE_VERSION}" \
+            --notes "Automated firmware build from commit ${GITHUB_SHA}."
+
+      - name: Save downloadable build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: firmware-v${{ needs.version-check.outputs.version }}
+          path: main/build/firmware.bin
+          if-no-files-found: error
+          retention-days: 30
